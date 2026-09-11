@@ -1,0 +1,37 @@
+{
+  "name": "flowtube-studio-next",
+  "productName": "FLOWSTUDIO",
+  "version": "1.8.5",
+  "description": "Editor de video con IA y Google Flow",
+  "author": "FLOWSTUDIO",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "@remotion/bundler": "^4.0.0",
+    "@remotion/captions": "^4.0.513",
+    "@remotion/install-whisper-cpp": "^4.0.513",
+    "@remotion/player": "^4.0.0",
+    "@remotion/renderer": "^4.0.0",
+    "@supabase/supabase-js": "^2.112.3",
+    "clsx": "^2.1.1",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.0",
+    "tailwind-merge": "^3.6.0",
+    "zundo": "^2.3.0",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  },
+  "optionalDependencies": {
+    "@remotion/compositor-darwin-arm64": "4.0.513",
+    "@remotion/compositor-darwin-x64": "4.0.513",
+    "@remotion/compositor-win32-x64-msvc": "4.0.513"
+  },
+  "main": "electron/main.cjs"
+}

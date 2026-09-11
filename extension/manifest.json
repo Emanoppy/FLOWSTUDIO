@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "FlowTube Studio Bridge",
+  "version": "0.2.1",
+  "description": "Conecta FlowTube Studio local con Google Flow para generar imagenes y videos.",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": [
+    "https://flow.google.com/*",
+    "https://flow.google/*",
+    "https://labs.google/*",
+    "https://aisandbox-pa.googleapis.com/*",
+    "http://127.0.0.1:4320/*",
+    "http://localhost:4320/*",
+    "http://127.0.0.1:4322/*",
+    "http://localhost:4322/*",
+    "http://127.0.0.1:4310/*",
+    "http://localhost:4310/*",
+    "http://127.0.0.1:4312/*",
+    "http://localhost:4312/*",
+    "http://127.0.0.1:3000/*",
+    "http://localhost:3000/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_scripts": [{
+    "matches": [
+      "http://127.0.0.1:4320/*",
+      "http://localhost:4320/*",
+      "http://127.0.0.1:4310/*",
+      "http://localhost:4310/*",
+      "http://127.0.0.1:3000/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:*/*",
+      "http://localhost:*/*"
+    ],
+    "js": ["bridge.js"],
+    "run_at": "document_start"
+  }],
+  "action": { "default_popup": "popup.html", "default_title": "FlowTube Studio" }
+}
