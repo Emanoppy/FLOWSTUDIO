@@ -789,28 +789,18 @@ async function getAccountAccessToken(account, forceRefresh = false) {
     }
   }
   try {
-    const win = accountWindows.get(account.id);
-    let sessionData = null;
-    if (win && !win.isDestroyed()) {
-      // Pedir la sesión DESDE la propia página (mismas cookies/cabeceras que usaría
-      // el navegador real) en vez de session.fromPartition().fetch() desde el proceso
-      // principal — Google no reconocía esa segunda forma como una sesión logueada
-      // y devolvía {} vacío aunque la ventana sí estuviera autenticada.
-      const pageUrlForDebug = win.webContents.getURL();
-      const inPageResult = await win.webContents.executeJavaScript("fetch('https://labs.google/fx/api/auth/session', { credentials: 'include' }).then(async r => ({ ok: r.status, body: await r.text() })).catch(err => ({ jsError: String(err && err.message || err) }))").catch(err => ({ execError: String(err && err.message || err) }));
-      writeLog("accounts:debug", "URL actual=" + pageUrlForDebug + " resultado crudo fetch en pÃ¡gina=" + JSON.stringify(inPageResult).slice(0, 1000));
-      if (inPageResult && typeof inPageResult.ok === "number" && inPageResult.body) {
-        try {
-          sessionData = JSON.parse(inPageResult.body);
-        } catch (parseErr) {
-          sessionData = null;
-        }
-      }
-    } else {
-      const accountSession = session.fromPartition(account.partition);
-      const sessionResponse = await accountSession.fetch("https://labs.google/fx/api/auth/session");
-      sessionData = sessionResponse.ok ? await sessionResponse.json() : null;
-    }
+    // Pedir la sesión desde el proceso principal con session.fromPartition().fetch(),
+    // usando las cookies guardadas de la cuenta directamente — no desde adentro de la
+    // página con webContents.executeJavaScript(). Hacerlo desde la página falla porque
+    // Google migró Flow de labs.google a flow.google.com: una vez que la ventana navega
+    // a flow.google.com, un fetch() de esa página hacia labs.google/fx/api/auth/session
+    // es cross-origin y el navegador lo bloquea por CORS ("Failed to fetch"), aunque la
+    // cuenta esté perfectamente logueada. session.fromPartition().fetch() no tiene ese
+    // problema porque no corre en el contexto de ninguna página — usa el cookie jar de
+    // la partición directo, sin importar qué URL esté cargada en ese momento.
+    const accountSession = session.fromPartition(account.partition);
+    const sessionResponse = await accountSession.fetch("https://labs.google/fx/api/auth/session");
+    const sessionData = sessionResponse.ok ? await sessionResponse.json() : null;
     writeLog("accounts:debug", "sesión Flow para " + account.label + " -> " + JSON.stringify(sessionData).slice(0, 1000));
     if (sessionData?.access_token) {
       const expiresAt = sessionData.expires ? new Date(sessionData.expires).getTime() : 0;
@@ -1037,6 +1027,61 @@ const findVideoPromptBoxScript = "(() => { const t = Array.from(document.querySe
 const findDownloadButtonScript = "(() => { const b = document.querySelector('button[aria-label=\"Descargar contenido multimedia\"]'); if (!b || b.disabled) return null; const r = b.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
 const findDownloadQualityMenuItemScript = "(() => { const items = Array.from(document.querySelectorAll(\"[role='menuitem'], .mat-mdc-menu-item\")); const match = items.find(el => /Tama.o original|360p/i.test(el.textContent || '')) || items[0]; if (!match) return null; const r = match.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
 const isStillGeneratingScript = "JSON.stringify(/\\b\\d{1,3}\\s?%/.test(document.body.innerText))";
+const findSettingsChipScript = "(() => { const b = document.querySelector('button[aria-label=\"Activador de ajustes\"]'); if (!b) return null; const r = b.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+// El panel de ajustes (Imagen/Vídeo, relación de aspecto, resolución, duración) se abre en
+// un overlay de Angular CDK, no dentro del toolbar — las opciones son botones "toggle" con
+// un <span class="toggle-text"> con el texto exacto (ej. "720p", "6 s", "Vídeo").
+function findToggleOptionScript(optionText) {
+  return "(() => { const spans = Array.from(document.querySelectorAll('.cdk-overlay-container .toggle-text')); const match = spans.find(s => (s.textContent || '').trim() === " + JSON.stringify(String(optionText)) + "); if (!match) return null; const btn = match.closest('button'); if (!btn) return null; const r = btn.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+}
+// Ajusta duración/resolución del video ANTES de generar, usando el panel real de Flow
+// (confirmado a mano: el chip queda mostrando "Vídeo · 720p · 6 s" y el resultado generado
+// respeta esos valores). Si no se encuentra algún control, sigue sin bloquear la generación
+// — mejor generar con los valores por defecto que fallar del todo.
+async function setVideoGenerationSettings(win, { duration, resolution, aspectRatio } = {}) {
+  if (!duration && !resolution && !aspectRatio) {
+    return;
+  }
+  const chipRectRaw = await win.webContents.executeJavaScript(findSettingsChipScript).catch(() => null);
+  const chipRect = chipRectRaw ? JSON.parse(chipRectRaw) : null;
+  if (!chipRect) {
+    return;
+  }
+  await clickElementAt(win, chipRect.x, chipRect.y);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  const videoToggleRectRaw = await win.webContents.executeJavaScript(findToggleOptionScript("Vídeo")).catch(() => null);
+  const videoToggleRect = videoToggleRectRaw ? JSON.parse(videoToggleRectRaw) : null;
+  if (videoToggleRect) {
+    await clickElementAt(win, videoToggleRect.x, videoToggleRect.y);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  if (duration) {
+    const durationRectRaw = await win.webContents.executeJavaScript(findToggleOptionScript(duration + " s")).catch(() => null);
+    const durationRect = durationRectRaw ? JSON.parse(durationRectRaw) : null;
+    if (durationRect) {
+      await clickElementAt(win, durationRect.x, durationRect.y);
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  if (resolution) {
+    const resolutionRectRaw = await win.webContents.executeJavaScript(findToggleOptionScript(resolution)).catch(() => null);
+    const resolutionRect = resolutionRectRaw ? JSON.parse(resolutionRectRaw) : null;
+    if (resolutionRect) {
+      await clickElementAt(win, resolutionRect.x, resolutionRect.y);
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  if (aspectRatio) {
+    const aspectRectRaw = await win.webContents.executeJavaScript(findToggleOptionScript(aspectRatio)).catch(() => null);
+    const aspectRect = aspectRectRaw ? JSON.parse(aspectRectRaw) : null;
+    if (aspectRect) {
+      await clickElementAt(win, aspectRect.x, aspectRect.y);
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  await win.webContents.executeJavaScript("document.body.click()").catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 400));
+}
 async function typeIntoBoxAt(win, rect, text) {
   await clickElementAt(win, rect.x, rect.y);
   await new Promise(resolve => setTimeout(resolve, 250));
@@ -1059,7 +1104,7 @@ async function typeIntoBoxAt(win, rect, text) {
 // añade como ingrediente (cuadro inicial), escribe el prompt de movimiento, genera,
 // espera a que desaparezca el indicador de progreso, y descarga el resultado con el
 // botón real de Flow (capturado vía Electron, ver waitForNextDownload).
-async function generateVideoViaFlowUI(account, win, prompt) {
+async function generateVideoViaFlowUI(account, win, prompt, videoSettings = {}) {
   const imageRectRaw = await win.webContents.executeJavaScript(findMostRecentGalleryImageScript).catch(() => null);
   const imageRect = imageRectRaw ? JSON.parse(imageRectRaw) : null;
   if (!imageRect) {
@@ -1074,6 +1119,7 @@ async function generateVideoViaFlowUI(account, win, prompt) {
   }
   await clickElementAt(win, addIngredientRect.x, addIngredientRect.y);
   await new Promise(resolve => setTimeout(resolve, 1200));
+  await setVideoGenerationSettings(win, videoSettings);
   const promptRectRaw = await win.webContents.executeJavaScript(findVideoPromptBoxScript).catch(() => null);
   const promptRect = promptRectRaw ? JSON.parse(promptRectRaw) : null;
   if (!promptRect) {
@@ -1088,6 +1134,8 @@ async function generateVideoViaFlowUI(account, win, prompt) {
   await clickElementAt(win, buttonRect.x, buttonRect.y);
   await new Promise(resolve => setTimeout(resolve, 5000));
   let consecutiveCleanChecks = 0;
+  // 180s (3 min) era muy justo — la generación de video con Veo puede tardar más,
+  // sobre todo si Google está con carga alta. Se sube a 6 min de margen.
   const finishedGenerating = await waitForCondition(async () => {
     const stillGoingRaw = await win.webContents.executeJavaScript(isStillGeneratingScript).catch(() => "true");
     if (stillGoingRaw === "true") {
@@ -1096,7 +1144,7 @@ async function generateVideoViaFlowUI(account, win, prompt) {
     }
     consecutiveCleanChecks++;
     return consecutiveCleanChecks >= 3 ? true : null;
-  }, 180000, 2500);
+  }, 360000, 2500);
   if (!finishedGenerating) {
     throw new Error("El video de Flow no terminó de generarse a tiempo.");
   }
@@ -1357,8 +1405,17 @@ const executeFlowRequest = async ({
           throw new Error("El prompt de video supera 12000 caracteres.");
         }
         try {
-          const result = await generateVideoViaFlowUI(account, win, payload.prompt);
-          writeLog("flow:video", "Video generado y descargado en " + account.label + ": " + result.videoUrl);
+          // payload.model/payload.duration vienen del selector "Imagen a Video" del
+          // Inspector (dist/assets, componente videoModel/videoDuration) — hasta ahora se
+          // guardaban en el estado de la escena pero nunca llegaban a la automatización.
+          // payload.format es el formato del proyecto ("short" = 9:16, "youtube" = 16:9).
+          const requestedDuration = Number(payload.duration) || null;
+          const requestedAspectRatio = payload.format === "short" ? "9:16" : payload.format === "youtube" ? "16:9" : null;
+          const result = await generateVideoViaFlowUI(account, win, payload.prompt, {
+            aspectRatio: requestedAspectRatio,
+            duration: requestedDuration
+          });
+          writeLog("flow:video", "Video generado y descargado en " + account.label + " (duración pedida: " + (requestedDuration || "por defecto") + "s): " + result.videoUrl);
           return result;
         } catch (err) {
           lastError = err;

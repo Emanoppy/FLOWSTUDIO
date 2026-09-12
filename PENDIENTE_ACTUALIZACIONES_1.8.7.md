@@ -1,5 +1,41 @@
 # Pendiente: features de v1.8.7 (del repo del compañero) que faltan portar
 
+## CONFIRMADO 2026-09-12 (sesión 2) — el API REST viejo está descartado para siempre, con evidencia dura
+
+Se re-investigó a fondo si el API REST vieja (`aisandbox-pa.googleapis.com`) todavía se puede
+usar, porque el código de v1.8.7 del compañero sigue apuntando a esos mismos endpoints. Se
+arregló primero un bug real: `getAccountAccessToken` pedía la sesión con
+`webContents.executeJavaScript(fetch(...))` **desde adentro de la página**, lo cual falla por
+CORS en cuanto la ventana está en `flow.google.com` (dominio distinto a `labs.google`, de donde
+sale el token) — se cambió a `session.fromPartition(...).fetch(...)` desde el proceso principal,
+que no tiene ese problema (no corre en contexto de ninguna página, usa el cookie jar directo). Es
+una mejora real y se dejó aplicada.
+
+Pero incluso arreglado eso, la causa de fondo sigue sin solución posible:
+- Revisando las cookies de la partición con `session.cookies.get()`: hay 26 cookies normales de
+  cuenta de Google (`SID`, `HSID`, etc. — la cuenta SÍ está logueada), pero para `labs.google`
+  solo existen `__Host-next-auth.csrf-token` y `__Secure-next-auth.callback-url` — **nunca la
+  cookie de sesión real** que necesita el endpoint `labs.google/fx/api/auth/session` para
+  devolver un `access_token`.
+- Se navegó la ventana real a mano a `labs.google/fx/tools/flow` (vía Chrome DevTools Protocol)
+  para ver si una visita fresca la generaba — Google redirige automáticamente a
+  `flow.google.com` sin que la cookie de sesión llegue a crearse, ni una vez.
+- Se probaron variantes razonables de un endpoint de sesión equivalente en el dominio nuevo
+  (`flow.google.com/api/auth/session`, `flow.google.com/fx/api/auth/session`,
+  `flow.google/api/auth/session`) — las tres devuelven el HTML normal de la SPA (no existe esa
+  API ahí).
+- **Confirmación definitiva**: se instaló la build oficial v1.8.7 del compañero tal cual (sin
+  modificar) en esta misma máquina, compartiendo la cuenta ya conectada — al intentar generar
+  algo, muestra la misma pantalla "Sign in with Google" en `labs.google/fx`, con un aviso del
+  propio Google: *"You can find Flow at flow.google"*. Mismo problema exacto en la versión
+  "que sí funciona" del compañero — lo más probable es que lo que él mostró funcionando haya
+  sido usar Flow directo en un navegador normal, no la generación automática de la app.
+
+**Conclusión: no es un bug nuestro, ni algo que se arregle "apuntando bien" a otra URL — el
+endpoint de sesión portable que este enfoque necesita ya no existe en el sistema actual de
+Google.** No vale la pena retomar este camino salvo que Google vuelva a exponer algo así. El
+camino correcto y ya funcionando es la automatización de la UI real (ver abajo).
+
 ## RESUELTO 2026-09-12 — Google Flow no generaba nada (bug crítico, no de licencia/plan)
 
 Diagnóstico completo tras varias horas de depuración con acceso directo a la ventana de

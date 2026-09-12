@@ -62,7 +62,11 @@ function runNpx(args) {
   // que le pasamos son rutas que construimos nosotros mismos con sanitize(), no
   // texto crudo de GitHub, así que no hay entrada externa sin filtrar en la línea
   // de comando.
-  const result = spawnSync("npx", args, { stdio: "inherit", shell: true });
+  // Con shell:true, Node no cita los argumentos del array por nosotros — si una
+  // ruta tiene espacios (como puede pasar con la carpeta del proyecto), hay que
+  // envolverla en comillas a mano o cmd.exe la corta en el primer espacio.
+  const quotedArgs = args.map(arg => (/\s/.test(arg) ? `"${arg}"` : arg));
+  const result = spawnSync("npx", quotedArgs, { stdio: "inherit", shell: true });
   if (result.error) {
     throw result.error;
   }
