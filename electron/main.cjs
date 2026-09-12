@@ -1134,8 +1134,12 @@ async function generateVideoViaFlowUI(account, win, prompt, videoSettings = {}) 
   await clickElementAt(win, buttonRect.x, buttonRect.y);
   await new Promise(resolve => setTimeout(resolve, 5000));
   let consecutiveCleanChecks = 0;
-  // 180s (3 min) era muy justo — la generación de video con Veo puede tardar más,
-  // sobre todo si Google está con carga alta. Se sube a 6 min de margen.
+  // 180s (3 min) fijos era muy justo, y un límite fijo de 6 min tampoco alcanza para
+  // clips más largos (probado: un video de 10s con Omni Flash superó los 6 min). El
+  // tiempo de espera ahora escala con la duración pedida: base de 4 min + 40s por cada
+  // segundo de video (un clip de 10s espera hasta ~10.7 min; uno de 4s, hasta ~6.7 min).
+  const requestedSeconds = Number(videoSettings.duration) || 8;
+  const waitTimeoutMs = Math.min(900000, 240000 + requestedSeconds * 40000);
   const finishedGenerating = await waitForCondition(async () => {
     const stillGoingRaw = await win.webContents.executeJavaScript(isStillGeneratingScript).catch(() => "true");
     if (stillGoingRaw === "true") {
@@ -1144,7 +1148,7 @@ async function generateVideoViaFlowUI(account, win, prompt, videoSettings = {}) 
     }
     consecutiveCleanChecks++;
     return consecutiveCleanChecks >= 3 ? true : null;
-  }, 360000, 2500);
+  }, waitTimeoutMs, 2500);
   if (!finishedGenerating) {
     throw new Error("El video de Flow no terminó de generarse a tiempo.");
   }
