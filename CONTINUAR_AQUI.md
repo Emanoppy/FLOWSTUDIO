@@ -9,6 +9,61 @@ lo relacionado a Google Flow (API rota, automatización de UI, etc).
 **Decile a Claude: "leé CONTINUAR_AQUI.md, RECOVERY_NOTES.md y PENDIENTE_ACTUALIZACIONES_1.8.7.md
 antes de seguir"** — con eso tiene todo el contexto.
 
+## Sesión 2026-09-12 (continuación, más tarde el mismo día) — pipeline de creativos con skill
+
+**Contexto nuevo**: el usuario tiene skills de Claude (metodologías de prompts para anuncios)
+en `D:\flow-flujo\SKILL_CLAUDE\` (fuera de este repo, es material aparte). La idea: usar un
+skill para generar guion + prompts de imagen/video, y cargarlos en FLOWSTUDIO para generar
+todo automáticamente.
+
+**Se probó el pipeline completo de punta a punta, con un producto de prueba (magnesio
+glicinato / marca ficticia "CalmMag", nicho salud, real y trending en 2026)**:
+
+1. Corrí el skill `anuncios-zack-d-films` a mano (no es código, es un prompt de Claude) y
+   generé un guion de 4 capítulos + prompts de imagen/video + B-roll, siguiendo el formato
+   Pixar-Disney/Start-End-Frame que define el skill.
+2. **Confirmado: FLOWSTUDIO ya tiene un modal "Batch Prompts"** (botón "Ver prompts de todas
+   las escenas" en el Inspector, o vista "Pegar Lista en Bloque") que reparte una lista de
+   prompts (separados por línea en blanco, o "Escena N:", o JSON) en una escena por prompt
+   automáticamente — función `applyPromptsToScenes` en el store. Se usó vía
+   `scripts/cdp-app.mjs` para pegar 5 prompts y confirmar "5/5 con prompt" — funciona.
+3. Se generaron las 5 imágenes una por una (botón "Generar imagen para esta escena") — 3 de
+   las 5 salieron mal (todas el mismo "cerebro", en vez de sus prompts reales).
+4. **Bug encontrado y confirmado (no es de FLOWSTUDIO, es de cómo yo automaticé la prueba)**:
+   seleccionar una escena en el timeline y clickear "generar" casi al mismo tiempo (sin
+   esperar a que React actualice qué escena está realmente seleccionada) dispara la
+   generación todavía apuntando a la escena anterior. **Fix: esperar ~2s entre seleccionar
+   una escena y clickear generar.** Con eso, las 5 imágenes salieron correctas. Si algún
+   humano hace clic muy rápido en la UI real podría pasarle lo mismo — vale la pena evaluar
+   si conviene deshabilitar el botón de generar brevemente tras cambiar de escena.
+5. **Se encontró y arregló un límite de tiempo real**: un video de 10s con Omni Flash superó
+   el límite de 6 minutos que ya habíamos subido. `generateVideoViaFlowUI` ahora escala el
+   tiempo de espera según la duración pedida (4 min base + 40s por segundo de video, tope 15
+   min) en vez de un número fijo.
+6. **Selectores de modelo/duración en el Inspector**: para poder elegir una duración distinta
+   a 8s hay que primero cambiar el modelo a "Omni Flash" — con "Veo 3.1 Lite" el selector de
+   duración queda deshabilitado a propósito (Veo 3.1 Lite siempre genera 8s fijos). No es un
+   bug, es cómo lo diseñaron.
+7. **Pendiente de confirmar**: quedó corriendo la generación del video de la Escena 1 (Omni
+   Flash, 10s) al cortar la sesión — revisar `.logs/flowtube.log` (buscar "Escena 1" cerca del
+   final) o abrir directo el proyecto de Flow para ver si terminó bien. El proyecto de Flow de
+   esta prueba completa (5 escenas: persona despierta, producto, mecanismo start/end frame,
+   persona durmiendo) queda en:
+   `https://flow.google.com/project/067f7c44-d8f9-4f4f-a4cd-3d08127b8d7f` (mismo Google
+   account que ya está conectado en la app — si se abre en un navegador normal con otra
+   cuenta logueada, no va a aparecer).
+8. **Próximo paso real, no hecho todavía**: automatizar el mecanismo "Fotogramas" de Flow
+   (distinto de "Ingredientes", que es lo único que automatizamos hasta ahora) — tiene dos
+   cuadros "Inicio" y "Fin" para cargar dos imágenes por separado y generar una transición
+   real entre ellas (Start/End Frame de verdad, con el MISMO objeto cambiando de estado, no
+   dos imágenes independientes como se hizo en esta prueba). Necesario para que el Capítulo 3
+   de este tipo de anuncios salga bien. Usar `scripts/cdp-flow.mjs` para investigar cómo se
+   cargan imágenes específicas en esos dos cuadros (todavía no investigado).
+9. Herramientas nuevas guardadas en `scripts/cdp-app.mjs` y `scripts/cdp-flow.mjs` — permiten
+   ejecutar JS dentro de la ventana de FLOWSTUDIO o de la ventana oculta de Flow via Chrome
+   DevTools Protocol, para probar/automatizar sin clickear a mano. Requieren que Electron
+   arranque con `--remote-debugging-port=9222`.
+
 ## Sesión 2026-09-12 (mañana) — resumen de lo que se hizo
 
 1. **Electron ya corre en esta máquina** (antes fallaba por un problema de extracción del
