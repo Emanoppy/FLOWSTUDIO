@@ -44,11 +44,20 @@ glicinato / marca ficticia "CalmMag", nicho salud, real y trending en 2026)**:
    a 8s hay que primero cambiar el modelo a "Omni Flash" — con "Veo 3.1 Lite" el selector de
    duración queda deshabilitado a propósito (Veo 3.1 Lite siempre genera 8s fijos). No es un
    bug, es cómo lo diseñaron.
-7. **Pendiente de confirmar**: quedó corriendo la generación del video de la Escena 1 (Omni
-   Flash, 10s) al cortar la sesión — revisar `.logs/flowtube.log` (buscar "Escena 1" cerca del
-   final) o abrir directo el proyecto de Flow para ver si terminó bien. El proyecto de Flow de
-   esta prueba completa (5 escenas: persona despierta, producto, mecanismo start/end frame,
-   persona durmiendo) queda en:
+7. **Pendiente sin resolver — video de 10s con Omni Flash falla por tiempo, consistentemente**:
+   se intentó 3 veces seguidas (con límite de 3 min, 6 min, y ~10.7 min escalado) generar el
+   video de la Escena 1 (Omni Flash, 10s) y las 3 veces se cortó por tiempo — nunca llegó a
+   descargarse. En cambio, videos de 6-8s SÍ funcionaron rápido (bajo 3 min, confirmado dos
+   veces con duraciones distintas). No está claro si 10s con Omni Flash es simplemente lento,
+   si depende de carga del lado de Google en ese momento, o algo específico de esa
+   combinación modelo+duración. **Antes de seguir escalando el timeout a ciegas**, el usuario
+   quiere revisar si la cuenta de Google conectada tiene de verdad una suscripción ULTRA
+   paga (no solo la etiqueta `"tier": "ULTRA"` que guarda `accounts.json`, que podría ser solo
+   un valor local sin verificar contra la cuenta real de Google) — una cuenta Ultra real
+   podría tener cola de generación prioritaria y resolver esto. Retomar esto en la sesión de
+   la tarde antes de seguir con duraciones largas.
+   El proyecto de Flow de esta prueba completa (5 escenas: persona despierta, producto,
+   mecanismo start/end frame, persona durmiendo) queda en:
    `https://flow.google.com/project/067f7c44-d8f9-4f4f-a4cd-3d08127b8d7f` (mismo Google
    account que ya está conectado en la app — si se abre en un navegador normal con otra
    cuenta logueada, no va a aparecer).
