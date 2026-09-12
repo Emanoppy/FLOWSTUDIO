@@ -196,12 +196,13 @@ app.post("/api/import", express.raw({
   }
   const generatedFilename = "" + crypto.randomUUID() + extension;
   const isImage = contentType.startsWith("image/") || [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(extension);
-  const targetDir = isImage && userImagesDir ? userImagesDir : userAudiosDir || libraryDir;
+  const isVideo = contentType.startsWith("video/") || [".mp4", ".webm", ".mov"].includes(extension);
+  const targetDir = isImage && userImagesDir ? userImagesDir : isVideo ? rendersDir : userAudiosDir || libraryDir;
   await fs.writeFile(path.join(targetDir, generatedFilename), req.body);
   res.json({
     ok: true,
-    url: "http://127.0.0.1:" + serverPort + "/library/" + generatedFilename,
-    mime: contentType.split(";")[0] || (isImage ? "image/jpeg" : "audio/mpeg"),
+    url: "http://127.0.0.1:" + serverPort + (isVideo ? "/renders/" : "/library/") + generatedFilename,
+    mime: contentType.split(";")[0] || (isImage ? "image/jpeg" : isVideo ? "video/mp4" : "audio/mpeg"),
     filename: generatedFilename
   });
 });

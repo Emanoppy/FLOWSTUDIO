@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 const DEFAULT_SUPABASE_URL = "https://hktxhsfwvvnujszlwnqj.supabase.co";
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dataRoot = process.env.FLOWTUBE_DATA_ROOT ? path.resolve(process.env.FLOWTUBE_DATA_ROOT) : rootDir;
@@ -28,6 +29,9 @@ export const supabase = supabaseEnabled ? createClient(url, serviceKey, {
   auth: {
     persistSession: false,
     autoRefreshToken: false
+  },
+  realtime: {
+    transport: WebSocket
   }
 }) : null;
 const fail = error => {
@@ -255,7 +259,7 @@ export async function sbActivateLicense(licenseKey, hwid) {
       user = await sbUpdateUser(existingUser.id, {
         hwid: hwid,
         licensePlan: license.plan,
-        licenseExpiresAt: licenseExpiresAt ? Date.parse(licenseExpiresAt) : null,
+        licenseExpiresAt: licenseExpiresAt,
         maxAccounts: maxAccounts,
         status: "active",
         notes: licenseName || existingUser.notes || normalizedKey
@@ -275,7 +279,7 @@ export async function sbActivateLicense(licenseKey, hwid) {
     user = await sbUpdateUser(user.id, {
       username: licenseName && user.username.startsWith("creator_") ? licenseName : user.username,
       licensePlan: license.plan,
-      licenseExpiresAt: licenseExpiresAt ? Date.parse(licenseExpiresAt) : null,
+      licenseExpiresAt: licenseExpiresAt,
       maxAccounts: maxAccounts,
       status: "active",
       notes: licenseName || user.notes || normalizedKey

@@ -11,6 +11,7 @@ const {
   fork
 } = require("child_process");
 const http = require("http");
+const os = require("os");
 const fs = require("fs");
 for (const stream of [process.stdout, process.stderr]) {
   stream?.on?.("error", err => {
@@ -788,19 +789,41 @@ async function getAccountAccessToken(account, forceRefresh = false) {
     }
   }
   try {
-    const accountSession = session.fromPartition(account.partition);
-    const sessionResponse = await accountSession.fetch("https://labs.google/fx/api/auth/session");
-    if (sessionResponse.ok) {
-      const sessionData = await sessionResponse.json();
-      if (sessionData?.access_token) {
-        const expiresAt = sessionData.expires ? new Date(sessionData.expires).getTime() : now + 3000000;
-        accountSessionCache.set(account.id, {
-          token: sessionData.access_token,
-          email: sessionData.user?.email || account.email,
-          expiresAt: expiresAt
-        });
-        return sessionData.access_token;
+    const win = accountWindows.get(account.id);
+    let sessionData = null;
+    if (win && !win.isDestroyed()) {
+      // Pedir la sesión DESDE la propia página (mismas cookies/cabeceras que usaría
+      // el navegador real) en vez de session.fromPartition().fetch() desde el proceso
+      // principal — Google no reconocía esa segunda forma como una sesión logueada
+      // y devolvía {} vacío aunque la ventana sí estuviera autenticada.
+      const pageUrlForDebug = win.webContents.getURL();
+      const inPageResult = await win.webContents.executeJavaScript("fetch('https://labs.google/fx/api/auth/session', { credentials: 'include' }).then(async r => ({ ok: r.status, body: await r.text() })).catch(err => ({ jsError: String(err && err.message || err) }))").catch(err => ({ execError: String(err && err.message || err) }));
+      writeLog("accounts:debug", "URL actual=" + pageUrlForDebug + " resultado crudo fetch en pÃ¡gina=" + JSON.stringify(inPageResult).slice(0, 1000));
+      if (inPageResult && typeof inPageResult.ok === "number" && inPageResult.body) {
+        try {
+          sessionData = JSON.parse(inPageResult.body);
+        } catch (parseErr) {
+          sessionData = null;
+        }
       }
+    } else {
+      const accountSession = session.fromPartition(account.partition);
+      const sessionResponse = await accountSession.fetch("https://labs.google/fx/api/auth/session");
+      sessionData = sessionResponse.ok ? await sessionResponse.json() : null;
+    }
+    writeLog("accounts:debug", "sesión Flow para " + account.label + " -> " + JSON.stringify(sessionData).slice(0, 1000));
+    if (sessionData?.access_token) {
+      const expiresAt = sessionData.expires ? new Date(sessionData.expires).getTime() : 0;
+      if (expiresAt && expiresAt <= now) {
+        writeLog("accounts", "Token expirado en sesión para " + account.label + ", requiere renovación.");
+        return null;
+      }
+      accountSessionCache.set(account.id, {
+        token: sessionData.access_token,
+        email: sessionData.user?.email || account.email,
+        expiresAt: expiresAt || now + 3000000
+      });
+      return sessionData.access_token;
     }
   } catch (err) {
     writeLog("accounts:error", "Error obteniendo token para " + account.id + ": " + err.message);
@@ -821,7 +844,7 @@ async function refreshAccountSession(account, providedWin) {
     try {
       await win.loadURL("https://labs.google/fx/tools/flow");
     } catch (err) {}
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    await new Promise(resolve => setTimeout(resolve, 4500));
     const currentUrl = win.webContents.getURL() || "";
     if (currentUrl.includes("accounts.google.com")) {
       if (currentUrl.includes("challenge") || currentUrl.includes("confirmidentifier") || currentUrl.includes("ServiceLogin")) {
@@ -841,6 +864,268 @@ async function refreshAccountSession(account, providedWin) {
     writeLog("accounts:error", "Error al renovar sesión para " + account.label + ": " + err.message);
   }
   return null;
+}
+async function waitForCondition(checkFn, timeoutMs, intervalMs = 1200) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await checkFn();
+    if (result) {
+      return result;
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+async function clickElementAt(win, x, y) {
+  win.webContents.sendInputEvent({
+    type: "mouseMove",
+    x: x,
+    y: y
+  });
+  win.webContents.sendInputEvent({
+    type: "mouseDown",
+    x: x,
+    y: y,
+    button: "left",
+    clickCount: 1
+  });
+  win.webContents.sendInputEvent({
+    type: "mouseUp",
+    x: x,
+    y: y,
+    button: "left",
+    clickCount: 1
+  });
+}
+const findPromptBoxScript = "(() => { const t = Array.from(document.querySelectorAll('[contenteditable]')).find(e => { const r = e.getBoundingClientRect(); return r.width > 100 && r.height > 0 && r.height < 100 && r.top > 0; }); if (!t) return null; const r = t.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const findGenerateButtonScript = "(() => { const b = document.querySelector('button[aria-label=\"Iniciar generación\"]'); if (!b || b.disabled) return null; const r = b.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const listFlowImagesScript = "JSON.stringify(Array.from(document.querySelectorAll('img')).map(img => img.src).filter(src => src.includes('flow-content.google')))";
+// Google retiró el API REST con Bearer token que usaba Flow (aisandbox-pa.googleapis.com);
+// la web app ahora usa un protocolo RPC interno (batchexecute) atado a reCAPTCHA y no
+// pensado para consumo externo. En vez de reimplementarlo (muy frágil, cambia con cada
+// despliegue), esto automatiza la interfaz real de Flow: escribe el prompt y hace clic
+// en "Iniciar generación" como lo haría una persona, y detecta la imagen resultante en el DOM.
+async function generateImageViaFlowUI(account, win, prompt) {
+  const promptRectRaw = await win.webContents.executeJavaScript(findPromptBoxScript).catch(() => null);
+  const promptRect = promptRectRaw ? JSON.parse(promptRectRaw) : null;
+  if (!promptRect) {
+    throw new Error("No se encontró el campo de prompt en la página de Flow.");
+  }
+  await clickElementAt(win, promptRect.x, promptRect.y);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  win.webContents.selectAll();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  win.webContents.sendInputEvent({
+    type: "keyDown",
+    keyCode: "Backspace"
+  });
+  win.webContents.sendInputEvent({
+    type: "keyUp",
+    keyCode: "Backspace"
+  });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  win.webContents.insertText(String(prompt || "").slice(0, 2000));
+  await new Promise(resolve => setTimeout(resolve, 500));
+  const existingImagesRaw = await win.webContents.executeJavaScript(listFlowImagesScript).catch(() => "[]");
+  const existingImages = new Set(JSON.parse(existingImagesRaw || "[]"));
+  const buttonRectRaw = await win.webContents.executeJavaScript(findGenerateButtonScript).catch(() => null);
+  const buttonRect = buttonRectRaw ? JSON.parse(buttonRectRaw) : null;
+  if (!buttonRect) {
+    throw new Error("El botón de generar no está disponible en Flow (deshabilitado o no encontrado).");
+  }
+  await clickElementAt(win, buttonRect.x, buttonRect.y);
+  const newImageUrl = await waitForCondition(async () => {
+    const currentImagesRaw = await win.webContents.executeJavaScript(listFlowImagesScript).catch(() => "[]");
+    const currentImages = JSON.parse(currentImagesRaw || "[]");
+    return currentImages.find(url => !existingImages.has(url)) || null;
+  }, 60000, 1500);
+  if (!newImageUrl) {
+    throw new Error("Flow no devolvió una imagen utilizable.");
+  }
+  const mediaIdMatch = newImageUrl.match(/\/image\/([a-f0-9-]+)/i);
+  return {
+    imageUrl: newImageUrl,
+    mediaId: mediaIdMatch ? mediaIdMatch[1] : crypto.randomUUID(),
+    referenceUsed: false,
+    referenceMediaId: null,
+    is2k: false,
+    accountLabel: account.label
+  };
+}
+// Flow renderiza el video en un <canvas> (no un <video src>) y el botón "Descargar"
+// dispara la descarga con un <a download href="blob:..."> creado y removido al vuelo —
+// no queda nada estable que leer del DOM. La forma confiable de capturarlo es el propio
+// mecanismo de descargas de Electron: dejamos que la página descargue como si un humano
+// le diera clic a "Descargar", y Chromium nos avisa via "will-download" sin importar
+// cómo se disparó internamente (funciona igual para blobs que para URLs reales).
+function waitForNextDownload(win, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const ses = win.webContents.session;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      ses.removeListener("will-download", onWillDownload);
+      reject(new Error("Se agotó el tiempo esperando la descarga de Flow."));
+    }, timeoutMs);
+    function onWillDownload(event, item) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ses.removeListener("will-download", onWillDownload);
+      const suggestedName = item.getFilename() || "flow-download.bin";
+      const tempPath = path.join(os.tmpdir(), "flowstudio-dl-" + Date.now() + "-" + suggestedName);
+      item.setSavePath(tempPath);
+      item.once("done", (doneEvent, state) => {
+        if (state === "completed") {
+          resolve({
+            filePath: tempPath,
+            mimeType: item.getMimeType() || "",
+            filename: suggestedName
+          });
+        } else {
+          reject(new Error("La descarga de Flow no se completó (" + state + ")."));
+        }
+      });
+    }
+    ses.on("will-download", onWillDownload);
+  });
+}
+function importDownloadedFileToLibrary(filePath, mimeHint, filenameHint) {
+  return new Promise((resolve, reject) => {
+    fs.readFile(filePath, (readErr, buffer) => {
+      fs.unlink(filePath, () => {});
+      if (readErr) {
+        reject(readErr);
+        return;
+      }
+      const req = http.request({
+        hostname: "127.0.0.1",
+        port: PORT_RENDER,
+        path: "/api/import",
+        method: "POST",
+        headers: {
+          "Content-Type": mimeHint || "application/octet-stream",
+          "Content-Length": buffer.length,
+          "x-filename": encodeURIComponent(filenameHint || "flow-media.bin")
+        }
+      }, res => {
+        let body = "";
+        res.on("data", chunk => body += chunk);
+        res.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            if (res.statusCode === 200 && data?.url) {
+              resolve(data);
+            } else {
+              reject(new Error(data?.error || "El servidor local rechazó el archivo importado."));
+            }
+          } catch (parseErr) {
+            reject(parseErr);
+          }
+        });
+      });
+      req.on("error", reject);
+      req.write(buffer);
+      req.end();
+    });
+  });
+}
+const findMostRecentGalleryImageScript = "(() => { const img = Array.from(document.querySelectorAll('img')).find(i => i.src.includes('flow.google.com/asb/') || i.src.includes('flow-content.google')); if (!img) return null; const r = img.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const findAddIngredientButtonScript = "(() => { const b = document.querySelector('button[aria-label=\"Añadir ingredientes a ventana para peticiones\"]'); if (!b) return null; const r = b.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const findVideoPromptBoxScript = "(() => { const t = Array.from(document.querySelectorAll('[contenteditable]')).find(e => { const r = e.getBoundingClientRect(); return r.width > 100 && r.height > 0 && r.height < 100 && r.top > 300; }); if (!t) return null; const r = t.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const findDownloadButtonScript = "(() => { const b = document.querySelector('button[aria-label=\"Descargar contenido multimedia\"]'); if (!b || b.disabled) return null; const r = b.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const findDownloadQualityMenuItemScript = "(() => { const items = Array.from(document.querySelectorAll(\"[role='menuitem'], .mat-mdc-menu-item\")); const match = items.find(el => /Tama.o original|360p/i.test(el.textContent || '')) || items[0]; if (!match) return null; const r = match.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()";
+const isStillGeneratingScript = "JSON.stringify(/\\b\\d{1,3}\\s?%/.test(document.body.innerText))";
+async function typeIntoBoxAt(win, rect, text) {
+  await clickElementAt(win, rect.x, rect.y);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  win.webContents.selectAll();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  win.webContents.sendInputEvent({
+    type: "keyDown",
+    keyCode: "Backspace"
+  });
+  win.webContents.sendInputEvent({
+    type: "keyUp",
+    keyCode: "Backspace"
+  });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  win.webContents.insertText(String(text || "").slice(0, 2000));
+  await new Promise(resolve => setTimeout(resolve, 400));
+}
+// Igual que generateImageViaFlowUI: en vez de reconstruir el RPC interno de Google,
+// automatiza la interfaz real de "imagen a video" — abre la imagen más reciente, la
+// añade como ingrediente (cuadro inicial), escribe el prompt de movimiento, genera,
+// espera a que desaparezca el indicador de progreso, y descarga el resultado con el
+// botón real de Flow (capturado vía Electron, ver waitForNextDownload).
+async function generateVideoViaFlowUI(account, win, prompt) {
+  const imageRectRaw = await win.webContents.executeJavaScript(findMostRecentGalleryImageScript).catch(() => null);
+  const imageRect = imageRectRaw ? JSON.parse(imageRectRaw) : null;
+  if (!imageRect) {
+    throw new Error("No se encontró ninguna imagen en Flow para convertir a video. Genera una imagen primero.");
+  }
+  await clickElementAt(win, imageRect.x, imageRect.y);
+  await new Promise(resolve => setTimeout(resolve, 800));
+  const addIngredientRectRaw = await win.webContents.executeJavaScript(findAddIngredientButtonScript).catch(() => null);
+  const addIngredientRect = addIngredientRectRaw ? JSON.parse(addIngredientRectRaw) : null;
+  if (!addIngredientRect) {
+    throw new Error("No se encontró el botón para usar la imagen como base del video.");
+  }
+  await clickElementAt(win, addIngredientRect.x, addIngredientRect.y);
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  const promptRectRaw = await win.webContents.executeJavaScript(findVideoPromptBoxScript).catch(() => null);
+  const promptRect = promptRectRaw ? JSON.parse(promptRectRaw) : null;
+  if (!promptRect) {
+    throw new Error("No se encontró el campo de prompt del editor de video en Flow.");
+  }
+  await typeIntoBoxAt(win, promptRect, prompt);
+  const buttonRectRaw = await win.webContents.executeJavaScript(findGenerateButtonScript).catch(() => null);
+  const buttonRect = buttonRectRaw ? JSON.parse(buttonRectRaw) : null;
+  if (!buttonRect) {
+    throw new Error("El botón de generar video no está disponible en Flow.");
+  }
+  await clickElementAt(win, buttonRect.x, buttonRect.y);
+  await new Promise(resolve => setTimeout(resolve, 5000));
+  let consecutiveCleanChecks = 0;
+  const finishedGenerating = await waitForCondition(async () => {
+    const stillGoingRaw = await win.webContents.executeJavaScript(isStillGeneratingScript).catch(() => "true");
+    if (stillGoingRaw === "true") {
+      consecutiveCleanChecks = 0;
+      return null;
+    }
+    consecutiveCleanChecks++;
+    return consecutiveCleanChecks >= 3 ? true : null;
+  }, 180000, 2500);
+  if (!finishedGenerating) {
+    throw new Error("El video de Flow no terminó de generarse a tiempo.");
+  }
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  const downloadRect = await waitForCondition(async () => {
+    const raw = await win.webContents.executeJavaScript(findDownloadButtonScript).catch(() => null);
+    return raw ? JSON.parse(raw) : null;
+  }, 20000, 1500);
+  if (!downloadRect) {
+    throw new Error("Flow no dejó descargar el video generado (¿la generación falló?).");
+  }
+  await clickElementAt(win, downloadRect.x, downloadRect.y);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  const qualityItemRect = await waitForCondition(async () => {
+    const raw = await win.webContents.executeJavaScript(findDownloadQualityMenuItemScript).catch(() => null);
+    return raw ? JSON.parse(raw) : null;
+  }, 8000, 500);
+  const downloadPromise = waitForNextDownload(win, 60000);
+  if (qualityItemRect) {
+    await clickElementAt(win, qualityItemRect.x, qualityItemRect.y);
+  }
+  const downloaded = await downloadPromise;
+  const imported = await importDownloadedFileToLibrary(downloaded.filePath, downloaded.mimeType || "video/mp4", downloaded.filename || "flow-video.mp4");
+  return {
+    videoUrl: imported.url,
+    mediaId: crypto.randomUUID(),
+    accountLabel: account.label,
+    done: true
+  };
 }
 function getActiveAccountWindows() {
   const activeAccounts = loadAccountsRegistry().filter(account => account.connected && account.projectId);
@@ -1046,81 +1331,15 @@ const executeFlowRequest = async ({
         if (!account.projectId) {
           throw new Error("La cuenta " + account.label + " no tiene un proyecto seleccionado.");
         }
-        const imageGenUrl = "https://aisandbox-pa.googleapis.com/v1/projects/" + account.projectId + "/flowMedia:batchGenerateImages";
-        const clientContext = {
-          projectId: account.projectId,
-          tool: "PINHOLE",
-          sessionId: "flowtube-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
-          recaptchaContext: {
-            token: "PLACEHOLDER",
-            applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB"
-          }
-        };
-        const isPortrait = payload.format === "short" || payload.aspectRatio === "9:16" || payload.aspectRatio === "portrait" || payload.aspectRatio === "IMAGE_ASPECT_RATIO_PORTRAIT";
-        const imageRequest = {
-          clientContext: clientContext,
-          imageAspectRatio: isPortrait ? "IMAGE_ASPECT_RATIO_PORTRAIT" : "IMAGE_ASPECT_RATIO_LANDSCAPE",
-          imageInputs: [],
-          imageModelName: IMAGE_MODELS[payload.model] || "NARWHAL",
-          seed: Math.floor(Math.random() * 1000000),
-          structuredPrompt: {
-            parts: [{
-              text: payload.prompt
-            }]
-          }
-        };
-        const referenceImages = Array.isArray(payload.referenceImages) && payload.referenceImages.length > 0 ? payload.referenceImages.slice(0, 3) : payload.referenceImage?.data ? [payload.referenceImage] : [];
-        const imageInputs = [];
-        for (const refImage of referenceImages) {
-          let flowMediaId = refImage.flowMediaId || null;
-          if (!flowMediaId && refImage.data) {
-            try {
-              flowMediaId = await uploadReferenceImage(account, win, refImage);
-            } catch (err) {
-              console.warn("[FLOWSTUDIO] Error subiendo referencia a cuenta " + account.label + ":", err.message);
-            }
-          }
-          if (flowMediaId) {
-            imageInputs.push({
-              imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
-              name: flowMediaId
-            });
-          }
-        }
-        if (imageInputs.length === 0 && payload.referenceMediaId) {
-          imageInputs.push({
-            imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
-            name: payload.referenceMediaId
-          });
-        }
-        if (imageInputs.length > 0) {
-          imageRequest.imageInputs = imageInputs;
-          imageRequest.imageModelName = "NARWHAL";
-        }
+        const hasReference = Boolean(payload.referenceImage || payload.referenceImages?.length || payload.referenceMediaId);
+        // No se logró automatizar el adjuntar la imagen de referencia dentro de Flow (ver
+        // PENDIENTE_ACTUALIZACIONES_1.8.7.md) — como mitigación mientras tanto, cuando el
+        // usuario configuró un Avatar/Estilo en el proyecto, reforzamos el prompt con una
+        // instrucción explícita de continuidad en vez de mandar la imagen en sí.
+        const effectivePrompt = hasReference ? "Mantén exactamente el mismo personaje/sujeto, su apariencia física, ropa, colores y el mismo estilo visual usados en las imágenes anteriores de este proyecto. " + String(payload.prompt || "") : payload.prompt;
         try {
-          const response = await callFlowApi(imageGenUrl, {
-            clientContext: clientContext,
-            mediaGenerationContext: {
-              batchId: crypto.randomUUID()
-            },
-            useNewMedia: true,
-            requests: [imageRequest]
-          }, "IMAGE_GENERATION");
-          const foundMedia = response?.media?.find(m => m?.name || m?.mediaId);
-          const imageUrl = response?.media?.find(m => m?.image?.generatedImage?.fifeUrl)?.image?.generatedImage?.fifeUrl;
-          const mediaId = response?.workflows?.find(w => w?.metadata?.primaryMediaId)?.metadata?.primaryMediaId || foundMedia?.name || foundMedia?.mediaId;
-          if (!mediaId || !imageUrl) {
-            throw new Error("Flow no devolvió una imagen utilizable.");
-          }
-          const referenceUsedId = imageInputs[0]?.name || payload.referenceMediaId || null;
-          return {
-            imageUrl: imageUrl,
-            mediaId: mediaId,
-            referenceUsed: Boolean(referenceUsedId),
-            referenceMediaId: referenceUsedId,
-            is2k: false,
-            accountLabel: account.label
-          };
+          const result = await generateImageViaFlowUI(account, win, effectivePrompt);
+          return result;
         } catch (err) {
           lastError = err;
           writeLog("flow:image:error", "Error en cuenta " + account.label + ": " + err.message);
@@ -1137,93 +1356,18 @@ const executeFlowRequest = async ({
         if (String(payload.prompt || "").length > 12000) {
           throw new Error("El prompt de video supera 12000 caracteres.");
         }
-        let mediaId = payload.mediaId;
-        if (payload.imageData && !mediaId) {
-          try {
-            const uploadedMediaId = await uploadReferenceImage(account, win, {
-              data: payload.imageData,
-              url: payload.imageUrl
-            });
-            if (uploadedMediaId) {
-              mediaId = uploadedMediaId;
-            }
-          } catch (err) {
-            console.warn("[FLOWSTUDIO] Error subiendo imagen de video a " + account.label + ":", err.message);
-          }
-        }
-        if (!mediaId) {
-          throw new Error("Falta la imagen de origen para generar el video.");
-        }
-        const videoModel = payload.model === "omni" ? "omni" : "veo-3.1-lite";
-        const duration = videoModel === "omni" && OMNI_DURATIONS.has(Number(payload.duration)) ? Number(payload.duration) : 8;
-        const videoModelKey = videoModel === "omni" ? "abra_i2v_" + duration + "s" : VIDEO_MODELS["veo-3.1-lite"];
-        const buildVideoRequest = startMediaId => ({
-          mediaGenerationContext: {
-            batchId: crypto.randomUUID()
-          },
-          clientContext: {
-            projectId: account.projectId,
-            tool: "PINHOLE",
-            recaptchaContext: {
-              token: "PLACEHOLDER",
-              applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB"
-            }
-          },
-          requests: [{
-            aspectRatio: payload.format === "short" || payload.aspectRatio === "9:16" || payload.aspectRatio === "portrait" || payload.aspectRatio === "VIDEO_ASPECT_RATIO_PORTRAIT" ? "VIDEO_ASPECT_RATIO_PORTRAIT" : "VIDEO_ASPECT_RATIO_LANDSCAPE",
-            seed: Math.floor(Math.random() * 1000000),
-            textInput: {
-              structuredPrompt: {
-                parts: [{
-                  text: String(payload.prompt || "Natural cinematic movement with stable subject and geometry.").trim()
-                }]
-              }
-            },
-            videoModelKey: videoModelKey,
-            requestContext: {
-              flowSdkInfo: VIDEO_APPLET
-            },
-            startImage: {
-              mediaId: startMediaId,
-              imageUsageType: "IMAGE_USAGE_TYPE_ASSET"
-            }
-          }],
-          useV2ModelConfig: true
-        });
-        let videoStartResponse;
         try {
-          videoStartResponse = await callFlowApi(VIDEO_START_ENDPOINT, buildVideoRequest(mediaId), "VIDEO_GENERATION");
+          const result = await generateVideoViaFlowUI(account, win, payload.prompt);
+          writeLog("flow:video", "Video generado y descargado en " + account.label + ": " + result.videoUrl);
+          return result;
         } catch (err) {
-          if (/Requested entity was not found|not found|404/i.test(err.message) && (payload.imageData || payload.imageUrl)) {
-            console.log("[FLOWSTUDIO] Imagen no encontrada en cuenta " + account.label + ". Re-subiendo ingrediente a su proyecto...");
-            const reuploadedMediaId = await uploadReferenceImage(account, win, {
-              data: payload.imageData,
-              url: payload.imageUrl
-            });
-            if (reuploadedMediaId) {
-              mediaId = reuploadedMediaId;
-              videoStartResponse = await callFlowApi(VIDEO_START_ENDPOINT, buildVideoRequest(mediaId), "VIDEO_GENERATION");
-            } else {
-              throw err;
-            }
-          } else {
-            throw err;
+          lastError = err;
+          writeLog("flow:video:error", "Error en cuenta " + account.label + ": " + err.message);
+          if (orderedEntries.length > 1) {
+            continue;
           }
+          throw err;
         }
-        const mediaName = videoStartResponse?.media?.find(m => m?.name)?.name;
-        if (!mediaName) {
-          throw new Error("Google Flow no devolvió el identificador del video.");
-        }
-        const modelLabel = videoModel === "omni" ? "Omni Flash" : "Veo 3.1 Lite";
-        writeLog("flow:video", "Video iniciado con " + modelLabel + " (" + duration + "s) en " + account.label + ": " + mediaName);
-        return {
-          mediaName: mediaName,
-          projectId: account.projectId,
-          accountId: account.id,
-          accountLabel: account.label,
-          model: videoModel,
-          requestedDuration: duration
-        };
       }
       if (requestType === "FLOW_VIDEO_STATUS") {
         if (!payload.mediaName) {

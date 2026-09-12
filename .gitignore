@@ -4,3 +4,5 @@ flowstudio.private.env
 dist-electron/
 release/
 *.log
+updates-inbox/
+.profile/
