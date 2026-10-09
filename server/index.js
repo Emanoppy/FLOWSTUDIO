@@ -115,8 +115,45 @@ if (supabaseEnabled) {
 const configuredAdminKeyHash = () => adminKeyHash() || remoteAdminHash;
 const hashAdminKey = key => crypto.createHash("sha256").update(String(key || "").trim().toLowerCase() + "::flowstudio-admin-v1").digest("hex");
 let renderBusy = false;
+// Seguridad: este servidor solo debe atender a la propia app (127.0.0.1/localhost en cualquier puerto,
+// porque Remotion sirve el bundle en un puerto aleatorio), a la extensión del puente y a las páginas de
+// Google Flow. Cualquier otra web (p. ej. una página que el usuario tenga abierta en el navegador) recibe 403.
+const FLOW_ORIGINS = new Set(["https://flow.google.com", "https://labs.google", "https://flow.google"]);
+const isLoopbackHost = hostname => ["127.0.0.1", "localhost", "[::1]", "::1"].includes(String(hostname || "").toLowerCase());
+const isAllowedOrigin = origin => {
+  if (!origin) {
+    return true;
+  }
+  if (origin.startsWith("chrome-extension://") || FLOW_ORIGINS.has(origin)) {
+    return true;
+  }
+  try {
+    const parsedOrigin = new URL(origin);
+    return (parsedOrigin.protocol === "http:" || parsedOrigin.protocol === "https:") && isLoopbackHost(parsedOrigin.hostname);
+  } catch {
+    return false;
+  }
+};
+app.use((req, res, next) => {
+  // Protección contra DNS rebinding: el Host siempre debe ser local.
+  const hostHeader = String(req.headers.host || "");
+  const hostName = hostHeader.startsWith("[") ? hostHeader.slice(0, hostHeader.indexOf("]") + 1) : hostHeader.split(":")[0];
+  if (hostName && !isLoopbackHost(hostName)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Host no permitido."
+    });
+  }
+  if (!isAllowedOrigin(req.headers.origin)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Origen no permitido."
+    });
+  }
+  next();
+});
 app.use(cors({
-  origin: true
+  origin: (origin, callback) => callback(null, isAllowedOrigin(origin))
 }));
 const extensionForMime = mimeType => {
   const mime = String(mimeType).split(";")[0].toLowerCase();
@@ -688,7 +725,9 @@ app.post("/api/render", async (req, res) => {
       error: "Cada escena debe durar entre 0.1 y 600 segundos y el proyecto no puede superar 4 horas."
     });
   }
-  const jobId = body.jobId || crypto.randomUUID();
+  // Seguridad: el jobId se usa para armar rutas de carpetas que luego se borran de forma recursiva,
+  // así que solo se acepta un identificador simple; cualquier otro valor se reemplaza por un UUID.
+  const jobId = typeof body.jobId === "string" && /^[A-Za-z0-9_-]{6,64}$/.test(body.jobId) ? body.jobId : crypto.randomUUID();
   activeRenders.set(jobId, {
     status: "preparing",
     progress: 5,

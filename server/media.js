@@ -7,8 +7,15 @@ const userOutputDir = process.env.FLOWSTUDIO_OUTPUT_DIR ? path.resolve(process.e
 const userImagesDir = userOutputDir ? path.join(userOutputDir, "Imagenes") : null;
 const userAudiosDir = userOutputDir ? path.join(userOutputDir, "Audios") : null;
 const runtimeLibraryDir = path.join(dataRoot, "runtime", "library");
+// Seguridad: une una ruta relativa a una carpeta base y devuelve null si el resultado se sale de esa carpeta
+// (por ejemplo "..%2f..%2farchivo"), para que /library/... nunca pueda leer archivos fuera de la biblioteca.
+const safeJoin = (baseDir, relativePath) => {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedFull = path.resolve(resolvedBase, String(relativePath || ""));
+  return resolvedFull === resolvedBase || resolvedFull.startsWith(resolvedBase + path.sep) ? resolvedFull : null;
+};
 const readLibraryFile = async relativePath => {
-  const candidatePaths = [userImagesDir ? path.join(userImagesDir, relativePath) : null, userAudiosDir ? path.join(userAudiosDir, relativePath) : null, path.join(runtimeLibraryDir, relativePath)].filter(Boolean);
+  const candidatePaths = [userImagesDir ? safeJoin(userImagesDir, relativePath) : null, userAudiosDir ? safeJoin(userAudiosDir, relativePath) : null, safeJoin(runtimeLibraryDir, relativePath)].filter(Boolean);
   for (const candidatePath of candidatePaths) {
     try {
       return await fsPromises.readFile(candidatePath);
@@ -36,19 +43,30 @@ const extensionFor = (mimeType, fallbackExt = ".jpg") => ({
 })[mimeType?.split(";")[0]] || fallbackExt;
 const safeName = input => String(input || "video").normalize("NFKD").replace(/[^a-zA-Z0-9-_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 70) || "video";
 export const projectName = project => safeName(project.title);
+// Seguridad (SSRF): solo se descargan medios de internet público o de las carpetas de medios del propio servidor
+// local. Se bloquean direcciones privadas, de enlace local y otros puertos de esta misma PC.
+const LOCAL_SERVER_PORT = String(Number(process.env.PORT) || 4322);
+const isPrivateHost = rawHost => {
+  const host = String(rawHost || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+    return true;
+  }
+  if (/^(127\.|10\.|0\.|192\.168\.|169\.254\.)/.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
+    return true;
+  }
+  return host === "::1" || host === "::" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80");
+};
 const allowedRemote = urlString => {
   try {
-    const parsedUrl = new URL(urlString, "http://127.0.0.1:4322");
-    if (parsedUrl.pathname.startsWith("/library/") || parsedUrl.pathname.startsWith("/assets/")) {
-      return true;
+    const parsedUrl = new URL(urlString, "http://127.0.0.1:" + LOCAL_SERVER_PORT);
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      return false;
     }
-    if (["127.0.0.1", "localhost"].includes(parsedUrl.hostname)) {
-      return true;
+    if (["127.0.0.1", "localhost"].includes(parsedUrl.hostname.toLowerCase())) {
+      const port = parsedUrl.port || (parsedUrl.protocol === "http:" ? "80" : "443");
+      return port === LOCAL_SERVER_PORT && /^\/(library|assets|renders)\//.test(parsedUrl.pathname);
     }
-    if (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") {
-      return true;
-    }
-    return false;
+    return !isPrivateHost(parsedUrl.hostname);
   } catch (err) {
     return false;
   }
